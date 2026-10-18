@@ -9,11 +9,6 @@
     <!-- Favicon -->
     <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%236366f1' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z'%3E%3C/path%3E%3Cpolyline points='14 2 14 8 20 8'%3E%3C/polyline%3E%3Cpath d='M9 15h6'%3E%3C/path%3E%3Cpath d='M9 11h6'%3E%3C/path%3E%3C/svg%3E" />
     
-    <!-- Google Fonts -->
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-    
     <link rel="stylesheet" href="/src/style.css" />
   </head>
   <body>
@@ -45,17 +40,17 @@
         <div class="nav-center">
           <!-- View Modes -->
           <div class="segmented-control" role="group" aria-label="Режим чтения">
-            <button id="mode-single" class="seg-btn active" title="По одной странице (Книжный режим)" data-mode="single">
+            <button id="mode-scroll" class="seg-btn active" title="Непрерывный свиток" data-mode="scroll">
+              <i data-lucide="scroll"></i>
+              <span>Свиток</span>
+            </button>
+            <button id="mode-single" class="seg-btn" title="По одной странице (Книжный режим)" data-mode="single">
               <i data-lucide="file"></i>
               <span>Одна стр.</span>
             </button>
             <button id="mode-dual" class="seg-btn" title="Разворот на две страницы" data-mode="dual">
               <i data-lucide="book-open"></i>
               <span>Разворот</span>
-            </button>
-            <button id="mode-scroll" class="seg-btn" title="Непрерывный свиток" data-mode="scroll">
-              <i data-lucide="scroll"></i>
-              <span>Свиток</span>
             </button>
           </div>
         </div>

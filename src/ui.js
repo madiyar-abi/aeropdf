@@ -587,7 +587,9 @@ export class UIManager {
   }
 
   onPageChange(current, total) {
-    this.pageNumInput.value = current;
+    if (document.activeElement !== this.pageNumInput) {
+      this.pageNumInput.value = current;
+    }
     this.pageSlider.value = current;
 
     // Update zoom label
@@ -599,15 +601,16 @@ export class UIManager {
       this.zoomValue.textContent = `${Math.round(this.engine.currentScale * 100)}%`;
     }
 
-    // Highlight active thumbnail
-    document.querySelectorAll('.thumb-card').forEach(card => {
-      const p = parseInt(card.dataset.pageNum, 10);
-      const isCurrent = p === current || (this.engine.viewMode === 'dual' && p === current + 1);
-      card.classList.toggle('active', isCurrent);
-      if (isCurrent && !this.isElementInViewport(card, this.thumbnailsContainer)) {
-        card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    // Highlight active thumbnail efficiently
+    const activeThumb = this.thumbnailsContainer.querySelector(`.thumb-card[data-page-num="${current}"]`);
+    if (activeThumb && !activeThumb.classList.contains('active')) {
+      const prev = this.thumbnailsContainer.querySelector('.thumb-card.active');
+      if (prev) prev.classList.remove('active');
+      activeThumb.classList.add('active');
+      if (!this.isElementInViewport(activeThumb, this.thumbnailsContainer)) {
+        activeThumb.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
       }
-    });
+    }
   }
 
   onSearchResults(currentMatch, totalMatches) {

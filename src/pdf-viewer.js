@@ -1,7 +1,7 @@
 import * as pdfjsLib from 'pdfjs-dist';
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 
-// Configure PDF.js worker using Vite asset URL
+// Configure PDF.js worker
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
 export class PDFViewerEngine {
@@ -17,56 +17,191 @@ export class PDFViewerEngine {
     this.currentPage = 1;
     this.totalPages = 0;
     this.currentScale = 1.0;
-    this.zoomMode = 'fit-width'; // 'fit-width', 'fit-page', or numeric
+    this.zoomMode = 'fit-width'; // 'fit-width', 'fit-page', or numeric float
     this.rotation = 0;
-    this.viewMode = 'single'; // 'single', 'dual', 'scroll'
-    
-    // Cancellation & active render tracking
-    this.activeRenderTasks = new Map();
-    this.preRenderCache = new Map(); // pageNum -> rendered canvas copy
-    
-    // Intersection observer for continuous scroll mode
-    this.scrollObserver = null;
-    this.pageElements = new Map();
-    this.pageDimensions = new Map();
+    this.viewMode = 'scroll'; // Default to 'scroll' (continuous vertical scroll) as requested by user
+
+    // Page viewports & aspect ratios
+    this.pageViewports = new Map(); // pageNum -> viewport at scale 1.0
+    this.pageElements = new Map();  // pageNum -> DOM container
+
+    // High performance Render Queue & LRU Cache
+    this.renderQueue = [];
+    this.isRendering = false;
+    this.activeRenderTasks = new Map(); // pageNum -> renderTask
+    this.renderedPagesCache = new Map(); // pageNum -> timestamp (LRU tracking)
+    this.MAX_CACHED_PAGES = 16; // Keep up to 16 pages rendered at once to prevent memory leaks
+
+    // Single page mode pre-render cache
+    this.singlePageCache = new Map();
+
+    // Wheel navigation throttle for single page mode
+    this.lastWheelTime = 0;
 
     // Search state
     this.searchQuery = '';
-    this.searchResults = []; // { pageNum, matchIndex, text }
+    this.searchResults = [];
     this.activeMatchIndex = -1;
 
     this.rawPdfData = null;
     this.fileName = '';
 
-    this.initObserver();
+    this.initScrollListener();
+    this.initWheelListener();
   }
 
-  initObserver() {
-    if (typeof IntersectionObserver === 'undefined') return;
-    this.scrollObserver = new IntersectionObserver((entries) => {
-      if (this.viewMode !== 'scroll') return;
-      entries.forEach(entry => {
-        const pageNum = parseInt(entry.target.dataset.pageNum, 10);
-        if (entry.isIntersecting) {
-          this.renderScrollPage(pageNum);
-          // Update current page based on visible page
-          this.currentPage = pageNum;
-          this.onPageChange(this.currentPage, this.totalPages);
-        } else {
-          this.unloadScrollPage(pageNum);
-        }
+  // Throttled scroll listener using requestAnimationFrame for 60fps tracking
+  initScrollListener() {
+    let ticking = false;
+    this.viewerArea.addEventListener('scroll', () => {
+      if (this.viewMode !== 'scroll' || !this.pdfDoc || ticking) return;
+      ticking = true;
+      requestAnimationFrame(() => {
+        this.onScroll();
+        ticking = false;
       });
-    }, {
-      root: this.viewerArea,
-      rootMargin: '300px 0px 300px 0px',
-      threshold: 0.1
-    });
+    }, { passive: true });
+  }
+
+  // Mouse wheel page flipping for single page / dual page mode
+  initWheelListener() {
+    this.viewerArea.addEventListener('wheel', (e) => {
+      if (this.viewMode === 'scroll' || !this.pdfDoc) return;
+      
+      const now = Date.now();
+      if (now - this.lastWheelTime < 280) return; // Debounce rapid wheel events
+      
+      if (e.deltaY > 30 || e.deltaX > 30) {
+        this.lastWheelTime = now;
+        this.nextPage();
+      } else if (e.deltaY < -30 || e.deltaX < -30) {
+        this.lastWheelTime = now;
+        this.prevPage();
+      }
+    }, { passive: true });
+  }
+
+  // Handle continuous scroll: determines visible page & schedules renders
+  onScroll() {
+    if (this.viewMode !== 'scroll' || !this.pdfDoc) return;
+
+    const scrollTop = this.viewerArea.scrollTop;
+    const clientHeight = this.viewerArea.clientHeight;
+    const viewportCenter = scrollTop + clientHeight / 2;
+
+    let closestPage = this.currentPage;
+    let minDistance = Infinity;
+
+    // Visible range with buffer (pages within 800px of visible viewport)
+    const visiblePages = [];
+
+    for (let i = 1; i <= this.totalPages; i++) {
+      const el = this.pageElements.get(i);
+      if (!el) continue;
+
+      const pageTop = el.offsetTop;
+      const pageBottom = pageTop + el.offsetHeight;
+      const dist = Math.abs(viewportCenter - (pageTop + el.offsetHeight / 2));
+
+      if (dist < minDistance) {
+        minDistance = dist;
+        closestPage = i;
+      }
+
+      // Check if within render buffer
+      if (pageBottom >= scrollTop - 800 && pageTop <= scrollTop + clientHeight + 800) {
+        visiblePages.push(i);
+      }
+    }
+
+    if (closestPage !== this.currentPage) {
+      this.currentPage = closestPage;
+      this.onPageChange(this.currentPage, this.totalPages);
+    }
+
+    // Schedule renders for pages in viewport buffer
+    this.prioritizePageRenders(visiblePages);
+  }
+
+  // Prioritize pages: visible pages first (closest to center), then others
+  prioritizePageRenders(pageNumbers) {
+    // Sort pages by distance to current page
+    pageNumbers.sort((a, b) => Math.abs(a - this.currentPage) - Math.abs(b - this.currentPage));
+
+    // Cancel queued renders that are no longer in visible range
+    this.renderQueue = this.renderQueue.filter(p => pageNumbers.includes(p));
+
+    for (const p of pageNumbers) {
+      const el = this.pageElements.get(p);
+      if (!el) continue;
+      const hasCanvas = el.querySelector('canvas[data-rendered="true"]');
+      if (!hasCanvas && !this.renderQueue.includes(p) && !this.activeRenderTasks.has(p)) {
+        this.renderQueue.push(p);
+      }
+    }
+
+    this.processRenderQueue();
+  }
+
+  async processRenderQueue() {
+    if (this.isRendering || this.renderQueue.length === 0) return;
+    this.isRendering = true;
+
+    const pageNum = this.renderQueue.shift();
+    const el = this.pageElements.get(pageNum);
+
+    if (el) {
+      await this.renderPageCanvas(pageNum, el);
+      this.renderedPagesCache.set(pageNum, Date.now());
+      this.pruneLRUCache();
+    }
+
+    this.isRendering = false;
+    if (this.renderQueue.length > 0) {
+      requestAnimationFrame(() => this.processRenderQueue());
+    }
+  }
+
+  // Keep memory light without aggressive flickering
+  pruneLRUCache() {
+    if (this.renderedPagesCache.size <= this.MAX_CACHED_PAGES) return;
+
+    // Find page furthest from current page that is not in immediate viewport
+    let furthestPage = null;
+    let maxDist = -1;
+
+    for (const pageNum of this.renderedPagesCache.keys()) {
+      const dist = Math.abs(pageNum - this.currentPage);
+      if (dist > 3 && dist > maxDist) {
+        maxDist = dist;
+        furthestPage = pageNum;
+      }
+    }
+
+    if (furthestPage) {
+      const el = this.pageElements.get(furthestPage);
+      if (el) {
+        const canvas = el.querySelector('canvas');
+        if (canvas) {
+          canvas.width = 1;
+          canvas.height = 1;
+          canvas.remove();
+        }
+        const textLayer = el.querySelector('.text-layer');
+        if (textLayer) textLayer.remove();
+      }
+      this.renderedPagesCache.delete(furthestPage);
+    }
   }
 
   async loadDocument(source, fileName = 'Документ.pdf') {
     this.fileName = fileName;
     this.cancelAllRenders();
-    this.preRenderCache.clear();
+    this.renderQueue = [];
+    this.renderedPagesCache.clear();
+    this.singlePageCache.clear();
+    this.pageViewports.clear();
+    this.pageElements.clear();
     this.searchResults = [];
     this.searchQuery = '';
 
@@ -100,19 +235,19 @@ export class PDFViewerEngine {
       this.totalPages = this.pdfDoc.numPages;
       this.currentPage = 1;
 
-      // Extract raw data if loaded via URL for download button
       if (!this.rawPdfData) {
         this.rawPdfData = await this.pdfDoc.getData();
       }
 
-      // Pre-fetch first page dimensions to compute fit scale
-      const firstPage = await this.pdfDoc.getPage(1);
-      const viewport = firstPage.getViewport({ scale: 1.0, rotation: this.rotation });
-      this.pageDimensions.set(1, { width: viewport.width, height: viewport.height });
+      // Fast-extract viewports for all pages to ensure instant zero-layout-shift scrolling
+      for (let i = 1; i <= Math.min(this.totalPages, 100); i++) {
+        const p = await this.pdfDoc.getPage(i);
+        const vp = p.getViewport({ scale: 1.0, rotation: this.rotation });
+        this.pageViewports.set(i, { width: vp.width, height: vp.height });
+      }
 
       this.computeScale();
 
-      // Notify caller
       this.onDocumentLoaded({
         numPages: this.totalPages,
         fileName: this.fileName,
@@ -129,23 +264,23 @@ export class PDFViewerEngine {
 
   computeScale() {
     if (!this.pdfDoc) return;
-    const paddingX = 40;
+    const paddingX = 48;
     const paddingY = 80;
     const containerW = Math.max(300, this.viewerArea.clientWidth - paddingX);
     const containerH = Math.max(300, this.viewerArea.clientHeight - paddingY);
 
-    const dims = this.pageDimensions.get(1) || { width: 595, height: 842 };
-    
+    const dims = this.pageViewports.get(1) || { width: 595, height: 842 };
+
     if (this.zoomMode === 'fit-width') {
       let targetW = containerW;
-      if (this.viewMode === 'dual') targetW = containerW / 2 - 10;
-      this.currentScale = Math.min(3.0, Math.max(0.2, targetW / dims.width));
+      if (this.viewMode === 'dual') targetW = (containerW / 2) - 16;
+      this.currentScale = Math.min(2.5, Math.max(0.3, targetW / dims.width));
     } else if (this.zoomMode === 'fit-page') {
       const scaleH = containerH / dims.height;
       let targetW = containerW;
-      if (this.viewMode === 'dual') targetW = containerW / 2 - 10;
+      if (this.viewMode === 'dual') targetW = (containerW / 2) - 16;
       const scaleW = targetW / dims.width;
-      this.currentScale = Math.min(3.0, Math.max(0.2, Math.min(scaleW, scaleH)));
+      this.currentScale = Math.min(2.5, Math.max(0.3, Math.min(scaleW, scaleH)));
     } else if (typeof this.zoomMode === 'number') {
       this.currentScale = this.zoomMode;
     }
@@ -159,32 +294,41 @@ export class PDFViewerEngine {
       this.zoomMode = modeOrScale;
       this.computeScale();
     }
-    this.preRenderCache.clear();
+    this.cancelAllRenders();
+    this.renderQueue = [];
+    this.renderedPagesCache.clear();
+    this.singlePageCache.clear();
     this.render();
   }
 
   zoomIn() {
-    const scales = [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0];
-    const next = scales.find(s => s > this.currentScale + 0.05) || (this.currentScale + 0.25);
-    this.setZoom(Math.min(3.0, next));
+    const scales = [0.4, 0.6, 0.75, 0.9, 1.0, 1.15, 1.3, 1.5, 1.75, 2.0, 2.5];
+    const next = scales.find(s => s > this.currentScale + 0.05) || (this.currentScale + 0.2);
+    this.setZoom(Math.min(2.5, next));
   }
 
   zoomOut() {
-    const scales = [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0];
-    const prev = [...scales].reverse().find(s => s < this.currentScale - 0.05) || (this.currentScale - 0.25);
-    this.setZoom(Math.max(0.3, prev));
+    const scales = [0.4, 0.6, 0.75, 0.9, 1.0, 1.15, 1.3, 1.5, 1.75, 2.0, 2.5];
+    const prev = [...scales].reverse().find(s => s < this.currentScale - 0.05) || (this.currentScale - 0.2);
+    this.setZoom(Math.max(0.35, prev));
   }
 
   rotate() {
     this.rotation = (this.rotation + 90) % 360;
-    this.preRenderCache.clear();
+    this.pageViewports.clear();
+    this.renderedPagesCache.clear();
+    this.singlePageCache.clear();
+    this.computeScale();
     this.render();
   }
 
   setViewMode(mode) {
     if (this.viewMode === mode) return;
     this.viewMode = mode;
-    this.preRenderCache.clear();
+    this.cancelAllRenders();
+    this.renderQueue = [];
+    this.renderedPagesCache.clear();
+    this.singlePageCache.clear();
     this.computeScale();
     this.render();
   }
@@ -192,7 +336,6 @@ export class PDFViewerEngine {
   async goToPage(pageNum) {
     if (!this.pdfDoc) return;
     const target = Math.max(1, Math.min(this.totalPages, pageNum));
-    if (this.currentPage === target && this.viewMode !== 'scroll') return;
     this.currentPage = target;
 
     if (this.viewMode === 'scroll') {
@@ -200,12 +343,12 @@ export class PDFViewerEngine {
       if (el) {
         el.scrollIntoView({ behavior: 'smooth', block: 'start' });
       }
+      this.onScroll();
     } else {
       await this.render();
     }
 
     this.onPageChange(this.currentPage, this.totalPages);
-    this.schedulePreRender();
   }
 
   nextPage() {
@@ -230,9 +373,7 @@ export class PDFViewerEngine {
     for (const [key, task] of this.activeRenderTasks.entries()) {
       try {
         task.cancel();
-      } catch (e) {
-        // ignore canceled
-      }
+      } catch (e) {}
     }
     this.activeRenderTasks.clear();
   }
@@ -243,163 +384,190 @@ export class PDFViewerEngine {
     this.container.innerHTML = '';
     this.container.className = `pages-wrapper mode-${this.viewMode}`;
 
-    if (this.viewMode === 'single') {
+    if (this.viewMode === 'scroll') {
+      await this.initContinuousScroll();
+    } else if (this.viewMode === 'single') {
       await this.renderSinglePage(this.currentPage);
-      this.schedulePreRender();
     } else if (this.viewMode === 'dual') {
       await this.renderDualPage(this.currentPage);
-      this.schedulePreRender();
-    } else if (this.viewMode === 'scroll') {
-      await this.initContinuousScroll();
     }
 
     this.onPageChange(this.currentPage, this.totalPages);
   }
 
-  // --- Single Page Mode ---
-  async renderSinglePage(pageNum) {
-    // Check pre-render cache first for 0ms flip!
-    const cached = this.preRenderCache.get(pageNum);
-    const pageContainer = document.createElement('div');
-    pageContainer.className = 'page-container';
-    pageContainer.dataset.pageNum = pageNum;
-    this.container.appendChild(pageContainer);
+  // --- Continuous Scroll: Instant Skeleton Layout & Sequential Render ---
+  async initContinuousScroll() {
+    this.pageElements.clear();
 
-    if (cached && cached.scale === this.currentScale && cached.rotation === this.rotation) {
-      const canvas = cached.canvas;
-      pageContainer.style.width = `${cached.width}px`;
-      pageContainer.style.height = `${cached.height}px`;
-      pageContainer.appendChild(canvas);
-      this.renderTextLayer(pageNum, pageContainer, cached.viewport);
-      return;
+    const fallbackDims = this.pageViewports.get(1) || { width: 595, height: 842 };
+
+    for (let i = 1; i <= this.totalPages; i++) {
+      const dims = this.pageViewports.get(i) || fallbackDims;
+      const scaledW = Math.round(dims.width * this.currentScale);
+      const scaledH = Math.round(dims.height * this.currentScale);
+
+      const slot = document.createElement('div');
+      slot.className = 'page-slot';
+      slot.dataset.pageNum = i;
+      slot.style.width = `${scaledW}px`;
+      slot.style.height = `${scaledH}px`;
+      slot.style.minHeight = `${scaledH}px`;
+
+      // Page number watermark
+      const watermark = document.createElement('div');
+      watermark.className = 'page-watermark';
+      watermark.textContent = `Стр. ${i}`;
+      slot.appendChild(watermark);
+
+      this.container.appendChild(slot);
+      this.pageElements.set(i, slot);
     }
 
-    await this.renderPageCanvas(pageNum, pageContainer);
+    // Scroll to current page
+    const targetSlot = this.pageElements.get(this.currentPage);
+    if (targetSlot) {
+      targetSlot.scrollIntoView({ block: 'start' });
+    }
+
+    // Trigger initial render of visible pages
+    requestAnimationFrame(() => this.onScroll());
   }
 
-  // --- Dual Page Mode ---
+  // --- Single Page View ---
+  async renderSinglePage(pageNum) {
+    const dims = this.pageViewports.get(pageNum) || { width: 595, height: 842 };
+    const scaledW = Math.round(dims.width * this.currentScale);
+    const scaledH = Math.round(dims.height * this.currentScale);
+
+    const slot = document.createElement('div');
+    slot.className = 'page-slot single-slot';
+    slot.dataset.pageNum = pageNum;
+    slot.style.width = `${scaledW}px`;
+    slot.style.height = `${scaledH}px`;
+
+    this.container.appendChild(slot);
+    this.pageElements.set(pageNum, slot);
+
+    await this.renderPageCanvas(pageNum, slot);
+    this.preloadAdjacentPages(pageNum);
+  }
+
+  // --- Dual Page View ---
   async renderDualPage(pageNum) {
     const p1 = pageNum;
     const p2 = pageNum + 1 <= this.totalPages ? pageNum + 1 : null;
 
-    const wrap1 = document.createElement('div');
-    wrap1.className = 'page-container';
-    wrap1.dataset.pageNum = p1;
-    this.container.appendChild(wrap1);
-    await this.renderPageCanvas(p1, wrap1);
+    const wrap = document.createElement('div');
+    wrap.className = 'dual-spread-container';
 
+    const dims1 = this.pageViewports.get(p1) || { width: 595, height: 842 };
+    const slot1 = document.createElement('div');
+    slot1.className = 'page-slot dual-slot left';
+    slot1.dataset.pageNum = p1;
+    slot1.style.width = `${Math.round(dims1.width * this.currentScale)}px`;
+    slot1.style.height = `${Math.round(dims1.height * this.currentScale)}px`;
+    wrap.appendChild(slot1);
+    this.pageElements.set(p1, slot1);
+
+    let slot2 = null;
     if (p2) {
-      const wrap2 = document.createElement('div');
-      wrap2.className = 'page-container';
-      wrap2.dataset.pageNum = p2;
-      this.container.appendChild(wrap2);
-      await this.renderPageCanvas(p2, wrap2);
+      const dims2 = this.pageViewports.get(p2) || { width: 595, height: 842 };
+      slot2 = document.createElement('div');
+      slot2.className = 'page-slot dual-slot right';
+      slot2.dataset.pageNum = p2;
+      slot2.style.width = `${Math.round(dims2.width * this.currentScale)}px`;
+      slot2.style.height = `${Math.round(dims2.height * this.currentScale)}px`;
+      wrap.appendChild(slot2);
+      this.pageElements.set(p2, slot2);
+    }
+
+    this.container.appendChild(wrap);
+
+    await this.renderPageCanvas(p1, slot1);
+    if (p2 && slot2) {
+      await this.renderPageCanvas(p2, slot2);
     }
   }
 
-  // --- Continuous Scroll Mode (Virtualized) ---
-  async initContinuousScroll() {
-    if (this.scrollObserver) {
-      this.scrollObserver.disconnect();
-    }
-    this.pageElements.clear();
+  // Preload next and previous pages in single page mode
+  preloadAdjacentPages(currentPage) {
+    const nextP = currentPage + 1;
+    const prevP = currentPage - 1;
 
-    const sampleDims = this.pageDimensions.get(1) || { width: 595, height: 842 };
-    const scaledW = sampleDims.width * this.currentScale;
-    const scaledH = sampleDims.height * this.currentScale;
+    const idleRunner = window.requestIdleCallback || ((cb) => setTimeout(cb, 80));
+    idleRunner(async () => {
+      for (const p of [nextP, prevP]) {
+        if (p >= 1 && p <= this.totalPages && !this.singlePageCache.has(p)) {
+          try {
+            const page = await this.pdfDoc.getPage(p);
+            const vp = page.getViewport({ scale: this.currentScale, rotation: this.rotation });
+            const canvas = document.createElement('canvas');
+            const ctx = canvas.getContext('2d', { alpha: false });
+            const dpr = Math.min(window.devicePixelRatio || 1, 1.75); // Capped for memory efficiency
+            
+            canvas.width = Math.floor(vp.width * dpr);
+            canvas.height = Math.floor(vp.height * dpr);
+            ctx.scale(dpr, dpr);
 
-    // Create placeholders for all pages so scrollbar is authentic
-    for (let i = 1; i <= this.totalPages; i++) {
-      const pageWrap = document.createElement('div');
-      pageWrap.className = 'page-container';
-      pageWrap.dataset.pageNum = i;
-      pageWrap.style.width = `${scaledW}px`;
-      pageWrap.style.height = `${scaledH}px`;
-      
-      this.container.appendChild(pageWrap);
-      this.pageElements.set(i, pageWrap);
-      if (this.scrollObserver) {
-        this.scrollObserver.observe(pageWrap);
+            await page.render({ canvasContext: ctx, viewport: vp }).promise;
+            this.singlePageCache.set(p, canvas);
+          } catch (e) {}
+        }
       }
-    }
-
-    // Scroll directly to current page
-    const currentWrap = this.pageElements.get(this.currentPage);
-    if (currentWrap) {
-      currentWrap.scrollIntoView({ block: 'start' });
-    }
+    });
   }
 
-  async renderScrollPage(pageNum) {
-    const wrap = this.pageElements.get(pageNum);
-    if (!wrap || wrap.querySelector('canvas')) return; // already rendered
-    await this.renderPageCanvas(pageNum, wrap);
-  }
+  // Core Canvas Renderer with devicePixelRatio capping to eliminate Mac GPU lag
+  async renderPageCanvas(pageNum, slot) {
+    if (!this.pdfDoc) return;
 
-  unloadScrollPage(pageNum) {
-    const wrap = this.pageElements.get(pageNum);
-    if (!wrap) return;
-    const task = this.activeRenderTasks.get(pageNum);
-    if (task) {
-      task.cancel();
-      this.activeRenderTasks.delete(pageNum);
-    }
-    // Remove canvas and text layer to free memory
-    const canvas = wrap.querySelector('canvas');
-    if (canvas) {
-      canvas.width = 1;
-      canvas.height = 1;
-      canvas.remove();
-    }
-    const textLayer = wrap.querySelector('.text-layer');
-    if (textLayer) textLayer.remove();
-  }
+    // Check if slot already has a canvas
+    if (slot.querySelector('canvas[data-rendered="true"]')) return;
 
-  // Core canvas render engine with HiDPI support & cancellation
-  async renderPageCanvas(pageNum, container) {
     try {
       const page = await this.pdfDoc.getPage(pageNum);
       const viewport = page.getViewport({ scale: this.currentScale, rotation: this.rotation });
       
-      this.pageDimensions.set(pageNum, { width: viewport.width / this.currentScale, height: viewport.height / this.currentScale });
+      this.pageViewports.set(pageNum, { width: viewport.width / this.currentScale, height: viewport.height / this.currentScale });
 
       const canvas = document.createElement('canvas');
       const ctx = canvas.getContext('2d', { alpha: false });
-      
-      const dpr = window.devicePixelRatio || 1;
+
+      // Cap devicePixelRatio at 1.75 (prevents 20MB textures on Mac Retina, zero perceived quality loss)
+      const dpr = Math.min(window.devicePixelRatio || 1, 1.75);
       canvas.width = Math.floor(viewport.width * dpr);
       canvas.height = Math.floor(viewport.height * dpr);
-      canvas.style.width = `${viewport.width}px`;
-      canvas.style.height = `${viewport.height}px`;
+      canvas.style.width = `${Math.floor(viewport.width)}px`;
+      canvas.style.height = `${Math.floor(viewport.height)}px`;
 
-      container.style.width = `${viewport.width}px`;
-      container.style.height = `${viewport.height}px`;
-
-      // Cancel any ongoing render on this page
-      if (this.activeRenderTasks.has(pageNum)) {
-        this.activeRenderTasks.get(pageNum).cancel();
-      }
+      slot.style.width = `${Math.floor(viewport.width)}px`;
+      slot.style.height = `${Math.floor(viewport.height)}px`;
 
       ctx.save();
       ctx.scale(dpr, dpr);
 
-      const renderContext = {
-        canvasContext: ctx,
-        viewport: viewport,
-      };
+      // Cancel ongoing render on this page if any
+      if (this.activeRenderTasks.has(pageNum)) {
+        this.activeRenderTasks.get(pageNum).cancel();
+      }
 
-      const renderTask = page.render(renderContext);
+      const renderTask = page.render({ canvasContext: ctx, viewport });
       this.activeRenderTasks.set(pageNum, renderTask);
 
       await renderTask.promise;
       this.activeRenderTasks.delete(pageNum);
       ctx.restore();
 
-      container.innerHTML = '';
-      container.appendChild(canvas);
+      canvas.dataset.rendered = 'true';
 
-      // Render overlay text layer for selection and search
-      this.renderTextLayer(pageNum, container, viewport, page);
+      // Remove watermark & insert canvas
+      const watermark = slot.querySelector('.page-watermark');
+      if (watermark) watermark.remove();
+
+      slot.appendChild(canvas);
+
+      // Render crisp text selection layer
+      this.renderTextLayer(pageNum, slot, viewport, page);
 
     } catch (err) {
       if (err.name !== 'RenderingCancelledException') {
@@ -408,65 +576,6 @@ export class PDFViewerEngine {
     }
   }
 
-  // Smart background pre-rendering for adjacent pages
-  schedulePreRender() {
-    if (this.viewMode !== 'single') return;
-    const nextP = this.currentPage + 1;
-    const prevP = this.currentPage - 1;
-
-    // Use requestIdleCallback or setTimeout
-    const queue = [];
-    if (nextP <= this.totalPages && !this.preRenderCache.has(nextP)) queue.push(nextP);
-    if (prevP >= 1 && !this.preRenderCache.has(prevP)) queue.push(prevP);
-
-    if (queue.length === 0) return;
-
-    const idleRunner = window.requestIdleCallback || ((cb) => setTimeout(cb, 100));
-    idleRunner(async () => {
-      for (const p of queue) {
-        if (this.preRenderCache.has(p) || this.activeRenderTasks.has(p)) continue;
-        try {
-          const page = await this.pdfDoc.getPage(p);
-          const viewport = page.getViewport({ scale: this.currentScale, rotation: this.rotation });
-          const canvas = document.createElement('canvas');
-          const ctx = canvas.getContext('2d', { alpha: false });
-          const dpr = window.devicePixelRatio || 1;
-          
-          canvas.width = Math.floor(viewport.width * dpr);
-          canvas.height = Math.floor(viewport.height * dpr);
-          canvas.style.width = `${viewport.width}px`;
-          canvas.style.height = `${viewport.height}px`;
-
-          ctx.save();
-          ctx.scale(dpr, dpr);
-          const renderTask = page.render({ canvasContext: ctx, viewport });
-          this.activeRenderTasks.set(`pre_${p}`, renderTask);
-          await renderTask.promise;
-          this.activeRenderTasks.delete(`pre_${p}`);
-          ctx.restore();
-
-          this.preRenderCache.set(p, {
-            canvas,
-            width: viewport.width,
-            height: viewport.height,
-            scale: this.currentScale,
-            rotation: this.rotation,
-            viewport
-          });
-
-          // Limit pre-render cache to 4 pages to avoid memory creep
-          if (this.preRenderCache.size > 4) {
-            const firstKey = this.preRenderCache.keys().next().value;
-            this.preRenderCache.delete(firstKey);
-          }
-        } catch (e) {
-          // ignore cancelled
-        }
-      }
-    });
-  }
-
-  // Text layer rendering for smooth text selection
   async renderTextLayer(pageNum, container, viewport, pageInstance = null) {
     try {
       const page = pageInstance || await this.pdfDoc.getPage(pageNum);
@@ -474,8 +583,8 @@ export class PDFViewerEngine {
       
       const textLayerDiv = document.createElement('div');
       textLayerDiv.className = 'text-layer';
-      textLayerDiv.style.width = `${viewport.width}px`;
-      textLayerDiv.style.height = `${viewport.height}px`;
+      textLayerDiv.style.width = `${Math.floor(viewport.width)}px`;
+      textLayerDiv.style.height = `${Math.floor(viewport.height)}px`;
       
       textContent.items.forEach(item => {
         if (!item.str || item.str.trim() === '') return;
@@ -489,7 +598,6 @@ export class PDFViewerEngine {
         span.style.fontSize = `${fontHeight}px`;
         span.style.fontFamily = item.fontName || 'sans-serif';
 
-        // Apply search highlights if search is active on this page
         if (this.searchQuery && item.str.toLowerCase().includes(this.searchQuery.toLowerCase())) {
           span.classList.add('search-highlight');
         }
@@ -498,31 +606,23 @@ export class PDFViewerEngine {
       });
 
       container.appendChild(textLayerDiv);
-    } catch (e) {
-      // non-critical
-    }
+    } catch (e) {}
   }
 
-  // Generate lazy thumbnail for sidebar
+  // Lazy thumbnail generator
   async renderThumbnail(pageNum, canvas) {
     if (!this.pdfDoc) return;
     try {
       const page = await this.pdfDoc.getPage(pageNum);
-      const viewport = page.getViewport({ scale: 0.25 });
-      const ctx = canvas.getContext('2d');
+      const viewport = page.getViewport({ scale: 0.22 });
+      const ctx = canvas.getContext('2d', { alpha: false });
       canvas.width = viewport.width;
       canvas.height = viewport.height;
 
-      await page.render({
-        canvasContext: ctx,
-        viewport
-      }).promise;
-    } catch (e) {
-      console.warn('Thumbnail render error:', e);
-    }
+      await page.render({ canvasContext: ctx, viewport }).promise;
+    } catch (e) {}
   }
 
-  // Table of Contents / Outline
   async getOutline() {
     if (!this.pdfDoc) return null;
     try {
@@ -532,7 +632,6 @@ export class PDFViewerEngine {
     }
   }
 
-  // In-document Text Search
   async search(query) {
     this.searchQuery = query.trim().toLowerCase();
     this.searchResults = [];
@@ -584,7 +683,6 @@ export class PDFViewerEngine {
     this.onSearchResults(this.activeMatchIndex + 1, this.searchResults.length);
   }
 
-  // Download PDF
   download() {
     if (!this.rawPdfData) return;
     const blob = new Blob([this.rawPdfData], { type: 'application/pdf' });
@@ -600,7 +698,6 @@ export class PDFViewerEngine {
     }, 100);
   }
 
-  // Print PDF
   print() {
     if (!this.rawPdfData) return;
     const blob = new Blob([this.rawPdfData], { type: 'application/pdf' });
