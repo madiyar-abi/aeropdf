@@ -1,0 +1,409 @@
+<!doctype html>
+<html lang="ru" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AeroPDF — Сверхбыстрый и плавный PDF ридер</title>
+    <meta name="description" content="Молниеносный PDF ридер без лагов. Мгновенное перелистывание страниц, аппаратное ускорение, умное кэширование и темная тема." />
+    
+    <!-- Favicon -->
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%236366f1' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z'%3E%3C/path%3E%3Cpolyline points='14 2 14 8 20 8'%3E%3C/polyline%3E%3Cpath d='M9 15h6'%3E%3C/path%3E%3Cpath d='M9 11h6'%3E%3C/path%3E%3C/svg%3E" />
+    
+    <!-- Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <div id="app" class="app-container">
+      
+      <!-- Top Navigation Bar -->
+      <header class="top-nav" id="top-nav">
+        <div class="nav-left">
+          <button id="btn-toggle-sidebar" class="btn-icon" title="Боковая панель (S)" aria-label="Открыть боковую панель">
+            <i data-lucide="panel-left"></i>
+          </button>
+          
+          <div class="brand">
+            <div class="brand-logo">
+              <i data-lucide="file-text"></i>
+            </div>
+            <div class="brand-info">
+              <span class="brand-title">AeroPDF</span>
+              <span class="brand-badge">Ultra-Fast</span>
+            </div>
+          </div>
+          
+          <div class="doc-info" id="doc-info">
+            <span class="doc-title" id="doc-title">Документ не выбран</span>
+            <span class="doc-meta" id="doc-meta"></span>
+          </div>
+        </div>
+
+        <div class="nav-center">
+          <!-- View Modes -->
+          <div class="segmented-control" role="group" aria-label="Режим чтения">
+            <button id="mode-single" class="seg-btn active" title="По одной странице (Книжный режим)" data-mode="single">
+              <i data-lucide="file"></i>
+              <span>Одна стр.</span>
+            </button>
+            <button id="mode-dual" class="seg-btn" title="Разворот на две страницы" data-mode="dual">
+              <i data-lucide="book-open"></i>
+              <span>Разворот</span>
+            </button>
+            <button id="mode-scroll" class="seg-btn" title="Непрерывный свиток" data-mode="scroll">
+              <i data-lucide="scroll"></i>
+              <span>Свиток</span>
+            </button>
+          </div>
+        </div>
+
+        <div class="nav-right">
+          <!-- Search Button -->
+          <button id="btn-search-toggle" class="btn-icon" title="Поиск по тексту (Cmd/Ctrl + F)">
+            <i data-lucide="search"></i>
+          </button>
+
+          <!-- Theme Selector -->
+          <div class="theme-dropdown-wrapper">
+            <button id="btn-theme-toggle" class="btn-icon" title="Сменить тему оформления">
+              <i data-lucide="moon" id="theme-icon"></i>
+            </button>
+            <div class="theme-menu" id="theme-menu">
+              <button class="theme-opt active" data-theme-val="dark">
+                <span class="theme-dot theme-dot-dark"></span> Тёмная (Midnight)
+              </button>
+              <button class="theme-opt" data-theme-val="light">
+                <span class="theme-dot theme-dot-light"></span> Светлая (Paper)
+              </button>
+              <button class="theme-opt" data-theme-val="sepia">
+                <span class="theme-dot theme-dot-sepia"></span> Сепия (Eye-care)
+              </button>
+              <button class="theme-opt" data-theme-val="invert">
+                <span class="theme-dot theme-dot-invert"></span> Инверсия (OLED)
+              </button>
+            </div>
+          </div>
+
+          <!-- Shortcuts help -->
+          <button id="btn-shortcuts" class="btn-icon" title="Горячие клавиши (?)">
+            <i data-lucide="keyboard"></i>
+          </button>
+
+          <!-- Download & Print -->
+          <button id="btn-download" class="btn-icon" title="Скачать PDF" disabled>
+            <i data-lucide="download"></i>
+          </button>
+          <button id="btn-print" class="btn-icon" title="Печать (Cmd/Ctrl + P)" disabled>
+            <i data-lucide="printer"></i>
+          </button>
+
+          <!-- Open file button -->
+          <label for="file-input" class="btn btn-primary" id="btn-open-file">
+            <i data-lucide="upload-cloud"></i>
+            <span>Открыть PDF</span>
+          </label>
+          <input type="file" id="file-input" accept="application/pdf" class="sr-only" />
+        </div>
+      </header>
+
+      <!-- Main Workspace -->
+      <div class="workspace">
+        
+        <!-- Left Sidebar (Thumbnails, Outline, Search, Recents) -->
+        <aside class="sidebar" id="sidebar">
+          <div class="sidebar-header">
+            <div class="sidebar-tabs">
+              <button class="tab-btn active" data-tab="thumbs" id="tab-thumbs" title="Миниатюры страниц">
+                <i data-lucide="layout-grid"></i>
+                <span>Страницы</span>
+              </button>
+              <button class="tab-btn" data-tab="toc" id="tab-toc" title="Оглавление документа">
+                <i data-lucide="list-tree"></i>
+                <span>Оглавление</span>
+              </button>
+              <button class="tab-btn" data-tab="recents" id="tab-recents" title="Недавние файлы">
+                <i data-lucide="history"></i>
+                <span>Недавние</span>
+              </button>
+            </div>
+          </div>
+
+          <div class="sidebar-body">
+            <!-- Thumbnails Tab -->
+            <div class="tab-pane active" id="pane-thumbs">
+              <div class="thumbnails-container" id="thumbnails-container">
+                <div class="empty-hint">Загрузите PDF для просмотра страниц</div>
+              </div>
+            </div>
+
+            <!-- Table of Contents Tab -->
+            <div class="tab-pane" id="pane-toc">
+              <div class="toc-container" id="toc-container">
+                <div class="empty-hint">Оглавление отсутствует</div>
+              </div>
+            </div>
+
+            <!-- Recent Documents Tab -->
+            <div class="tab-pane" id="pane-recents">
+              <div class="recents-container" id="recents-container">
+                <div class="empty-hint">История пуста</div>
+              </div>
+            </div>
+          </div>
+        </aside>
+
+        <!-- Viewer Main Area -->
+        <main class="viewer-area" id="viewer-area" tabindex="0">
+          
+          <!-- Drop Zone Empty State (Shown when no PDF is loaded) -->
+          <div class="welcome-screen" id="welcome-screen">
+            <div class="welcome-card">
+              <div class="welcome-icon-glow">
+                <i data-lucide="file-up" class="welcome-icon"></i>
+              </div>
+              <h1 class="welcome-title">Сверхбыстрый просмотрщик PDF</h1>
+              <p class="welcome-desc">
+                Забудьте о зависаниях браузера. Плавное перелистывание с предварительной отрисовкой в памяти, аппаратное ускорение и поддержка любых файлов.
+              </p>
+              
+              <div class="welcome-actions">
+                <label for="welcome-file-input" class="btn btn-hero">
+                  <i data-lucide="folder-open"></i>
+                  <span>Выбрать PDF на компьютере</span>
+                </label>
+                <input type="file" id="welcome-file-input" accept="application/pdf" class="sr-only" />
+
+                <button id="btn-load-sample" class="btn btn-secondary">
+                  <i data-lucide="sparkles"></i>
+                  <span>Открыть демо-документ</span>
+                </button>
+              </div>
+
+              <div class="welcome-features">
+                <div class="feat-item">
+                  <i data-lucide="zap"></i>
+                  <span>Мгновенное перелистывание (0 мс задержки)</span>
+                </div>
+                <div class="feat-item">
+                  <i data-lucide="shield-check"></i>
+                  <span>100% конфиденциально (файлы не уходят в сеть)</span>
+                </div>
+                <div class="feat-item">
+                  <i data-lucide="eye"></i>
+                  <span>Тёмная, светлая, сепия и OLED темы</span>
+                </div>
+              </div>
+
+              <div class="drop-hint-text">
+                или просто перетащите файл в любую точку окна
+              </div>
+            </div>
+          </div>
+
+          <!-- Document Render Stage -->
+          <div class="render-stage hidden" id="render-stage">
+            <div class="pages-wrapper" id="pages-wrapper">
+              <!-- Dynamically populated page containers and canvases -->
+            </div>
+          </div>
+
+          <!-- Quick Navigation Overlay Click Targets for instant page turn on click -->
+          <div class="page-nav-overlay hidden" id="page-nav-overlay">
+            <button class="nav-hitbox left" id="hitbox-prev" title="Предыдущая страница (← / Колесо)">
+              <div class="hitbox-indicator">
+                <i data-lucide="chevron-left"></i>
+              </div>
+            </button>
+            <button class="nav-hitbox right" id="hitbox-next" title="Следующая страница (→ / Пробел)">
+              <div class="hitbox-indicator">
+                <i data-lucide="chevron-right"></i>
+              </div>
+            </button>
+          </div>
+
+          <!-- Search Floating Bar -->
+          <div class="search-floating-bar hidden" id="search-floating-bar">
+            <div class="search-input-group">
+              <i data-lucide="search" class="search-bar-icon"></i>
+              <input type="text" id="search-input" placeholder="Поиск в документе..." />
+              <span class="search-stats" id="search-stats">0 из 0</span>
+            </div>
+            <div class="search-actions">
+              <button id="btn-search-prev" class="btn-icon-sm" title="Предыдущее совпадение (Shift+Enter)">
+                <i data-lucide="chevron-up"></i>
+              </button>
+              <button id="btn-search-next" class="btn-icon-sm" title="Следующее совпадение (Enter)">
+                <i data-lucide="chevron-down"></i>
+              </button>
+              <button id="btn-search-close" class="btn-icon-sm" title="Закрыть (Esc)">
+                <i data-lucide="x"></i>
+              </button>
+            </div>
+          </div>
+
+        </main>
+      </div>
+
+      <!-- Bottom Floating Control Dock -->
+      <footer class="bottom-dock" id="bottom-dock">
+        <div class="dock-content">
+          
+          <!-- Page Navigation Group -->
+          <div class="dock-group page-controls">
+            <button id="btn-page-prev" class="dock-btn" title="Предыдущая страница (←)">
+              <i data-lucide="chevron-left"></i>
+            </button>
+            
+            <div class="page-counter">
+              <input type="number" id="page-num-input" min="1" value="1" aria-label="Номер страницы" />
+              <span class="page-divider">/</span>
+              <span id="page-total">1</span>
+            </div>
+
+            <button id="btn-page-next" class="dock-btn" title="Следующая страница (→)">
+              <i data-lucide="chevron-right"></i>
+            </button>
+          </div>
+
+          <div class="dock-separator"></div>
+
+          <!-- Quick Page Scrubber Slider -->
+          <div class="dock-group slider-group">
+            <input type="range" id="page-slider" min="1" max="1" value="1" title="Быстрая перемотка страниц" />
+          </div>
+
+          <div class="dock-separator"></div>
+
+          <!-- Zoom Controls -->
+          <div class="dock-group zoom-controls">
+            <button id="btn-zoom-out" class="dock-btn" title="Уменьшить (-)">
+              <i data-lucide="minus"></i>
+            </button>
+            
+            <div class="zoom-select-wrapper">
+              <button id="btn-zoom-preset" class="zoom-display-btn" title="Выбор масштаба">
+                <span id="zoom-value">100%</span>
+                <i data-lucide="chevron-down" class="zoom-dropdown-arrow"></i>
+              </button>
+              <div class="zoom-menu hidden" id="zoom-menu">
+                <button data-zoom="fit-page">По размеру страницы</button>
+                <button data-zoom="fit-width">По ширине окна</button>
+                <button data-zoom="0.5">50%</button>
+                <button data-zoom="0.75">75%</button>
+                <button data-zoom="1.0">100% (Реальный размер)</button>
+                <button data-zoom="1.25">125%</button>
+                <button data-zoom="1.5">150%</button>
+                <button data-zoom="2.0">200%</button>
+              </div>
+            </div>
+
+            <button id="btn-zoom-in" class="dock-btn" title="Увеличить (+)">
+              <i data-lucide="plus"></i>
+            </button>
+
+            <button id="btn-fit-width" class="dock-btn" title="По ширине окна (W)">
+              <i data-lucide="move-horizontal"></i>
+            </button>
+
+            <button id="btn-fit-page" class="dock-btn" title="По высоте страницы (P)">
+              <i data-lucide="maximize-2"></i>
+            </button>
+          </div>
+
+          <div class="dock-separator"></div>
+
+          <!-- Extra Tools (Rotate, Fullscreen) -->
+          <div class="dock-group extra-controls">
+            <button id="btn-rotate" class="dock-btn" title="Повернуть на 90° (R)">
+              <i data-lucide="rotate-cw"></i>
+            </button>
+            
+            <button id="btn-fullscreen" class="dock-btn" title="Полноэкранный режим (F)">
+              <i data-lucide="expand"></i>
+            </button>
+          </div>
+
+        </div>
+      </footer>
+
+      <!-- Global Drag & Drop Overlay -->
+      <div class="drag-overlay hidden" id="drag-overlay">
+        <div class="drag-modal">
+          <i data-lucide="file-check-2" class="drag-modal-icon"></i>
+          <h2>Отпустите файл для мгновенного чтения</h2>
+          <p>Поддерживаются любые PDF документы</p>
+        </div>
+      </div>
+
+      <!-- Shortcuts Modal -->
+      <div class="modal-backdrop hidden" id="modal-shortcuts">
+        <div class="modal-card">
+          <div class="modal-header">
+            <h3><i data-lucide="command"></i> Горячие клавиши</h3>
+            <button class="btn-close-modal" id="btn-close-shortcuts"><i data-lucide="x"></i></button>
+          </div>
+          <div class="modal-body">
+            <div class="shortcuts-grid">
+              <div class="shortcut-row">
+                <span class="shortcut-desc">Следующая страница</span>
+                <span class="shortcut-keys"><kbd>→</kbd> <kbd>J</kbd> <kbd>Space</kbd></span>
+              </div>
+              <div class="shortcut-row">
+                <span class="shortcut-desc">Предыдущая страница</span>
+                <span class="shortcut-keys"><kbd>←</kbd> <kbd>K</kbd> <kbd>Shift+Space</kbd></span>
+              </div>
+              <div class="shortcut-row">
+                <span class="shortcut-desc">Первая / Последняя страница</span>
+                <span class="shortcut-keys"><kbd>Home</kbd> / <kbd>End</kbd></span>
+              </div>
+              <div class="shortcut-row">
+                <span class="shortcut-desc">Увеличить / Уменьшить</span>
+                <span class="shortcut-keys"><kbd>+</kbd> / <kbd>-</kbd></span>
+              </div>
+              <div class="shortcut-row">
+                <span class="shortcut-desc">Сброс масштаба (100%)</span>
+                <span class="shortcut-keys"><kbd>0</kbd></span>
+              </div>
+              <div class="shortcut-row">
+                <span class="shortcut-desc">По ширине / По странице</span>
+                <span class="shortcut-keys"><kbd>W</kbd> / <kbd>P</kbd></span>
+              </div>
+              <div class="shortcut-row">
+                <span class="shortcut-desc">Повернуть на 90°</span>
+                <span class="shortcut-keys"><kbd>R</kbd></span>
+              </div>
+              <div class="shortcut-row">
+                <span class="shortcut-desc">Полноэкранный режим</span>
+                <span class="shortcut-keys"><kbd>F</kbd></span>
+              </div>
+              <div class="shortcut-row">
+                <span class="shortcut-desc">Открыть боковую панель</span>
+                <span class="shortcut-keys"><kbd>S</kbd></span>
+              </div>
+              <div class="shortcut-row">
+                <span class="shortcut-desc">Поиск по тексту</span>
+                <span class="shortcut-keys"><kbd>Cmd / Ctrl + F</kbd></span>
+              </div>
+              <div class="shortcut-row">
+                <span class="shortcut-desc">Сменить тему</span>
+                <span class="shortcut-keys"><kbd>D</kbd></span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Loading Spinner Toast -->
+      <div class="loading-toast hidden" id="loading-toast">
+        <div class="spinner"></div>
+        <span id="loading-toast-text">Обработка PDF...</span>
+      </div>
+
+    </div>
+
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
